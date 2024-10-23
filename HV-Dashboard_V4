@@ -1,0 +1,344 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ClusterName,
+
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = "C:\Scripts"
+)
+
+Function Get-CSVtoPhysicalDiskMapping {
+    param ($volumeowner, $csvvolume)
+    $cimSession = New-CimSession -ComputerName $volumeowner
+    $volumeInfo = Get-Disk -CimSession $cimSession | Get-Partition | Select DiskNumber, @{Name="Volume";Expression={Get-Volume -Partition $_ | Select -ExpandProperty ObjectId}}
+    $csvvolume2 = "*" + $csvvolume + "*"
+    $csvdisknumber = ($volumeinfo | Where-Object { $_.Volume -like $csvVolume2}).DiskNumber
+    $DiskDetails = Get-Disk -CimSession $cimSession -Number $csvdisknumber
+    $CSVStorage[$h].DiskType = $DiskDetails.ProvisioningType
+    $CSVStorage[$h].RaidType = $DiskDetails.Model
+    $CSVStorage[$h].StorageInformation = $DiskDetails.Manufacturer
+    $CSVStorage[$h].Connectivity = $DiskDetails.BusType
+}
+
+
+# Import required modules
+Import-Module FailoverClusters
+Import-Module Hyper-V
+
+# Get current date and time
+$currentDateTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$fileDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
+
+# Specify the name of your failover cluster
+$clusterName = "aarhv01"
+
+# Get all nodes in the failover cluster
+$clusterNodes = Get-ClusterNode -Cluster $clusterName
+
+# Initialize arrays to store VM and host details
+$vmDetails = @()
+$hyperVHostDetails = @()
+
+foreach ($node in $clusterNodes) {
+    $vms = Invoke-Command -ComputerName $node.Name -ScriptBlock {
+        Get-VM
+    }
+
+    foreach ($vm in $vms) {
+        $vmInfo = Invoke-Command -ComputerName $node.Name -ScriptBlock {
+            param($vmName)
+            $vm = Get-VM -Name $vmName
+            $uptime = if ($vm.State -eq 'Running') {
+                $vm.Uptime
+            } else {
+                [TimeSpan]::Zero
+            }
+            $assignedMemory = $vm.MemoryAssigned / 1GB
+            $assignedVCPU = $vm.ProcessorCount
+            
+            $virtualDisks = @()
+            $vm.HardDrives | ForEach-Object {
+                $vhd = Get-VHD -Path $_.Path
+                $virtualDisks += [PSCustomObject]@{
+                    Name = Split-Path $_.Path -Leaf
+                    Type = $vhd.VhdType.ToString()
+                    Size = [math]::Round($vhd.Size / 1GB, 2)
+                }
+            }
+
+            return @{
+                Uptime = $uptime
+                AssignedMemory = $assignedMemory
+                AssignedVCPU = $assignedVCPU
+                VirtualDisks = $virtualDisks
+            }
+        } -ArgumentList $vm.Name
+
+        $clustered = $null -ne (Get-ClusterResource -Cluster $clusterName | Where-Object { $_.ResourceType -eq "Virtual Machine" -and $_.OwnerGroup.Name -eq $vm.Name })
+
+        $vmDetails += [PSCustomObject]@{
+            'VM Name' = $vm.Name
+            'Uptime' = "$($vmInfo.Uptime.Days) days, $($vmInfo.Uptime.Hours) hours, $($vmInfo.Uptime.Minutes) minutes"
+            'Clustered' = $clustered
+            'Assigned Memory (GB)' = $vmInfo.AssignedMemory.ToString('N2')
+            'Assigned vCPU' = $vmInfo.AssignedVCPU
+            'Virtual Disks' = $vmInfo.VirtualDisks
+        }
+    }
+
+    # Collect host information
+    $hostInfo = Invoke-Command -ComputerName $node.Name -ScriptBlock {
+        $computerSystem = Get-CimInstance Win32_ComputerSystem
+        $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+        $operatingSystem = Get-CimInstance Win32_OperatingSystem
+        $totalPhysicalMemory = $computerSystem.TotalPhysicalMemory / 1GB
+        $availablePhysicalMemory = $operatingSystem.FreePhysicalMemory / 1MB
+        $availablePhysicalMemoryPercent = ($availablePhysicalMemory / $totalPhysicalMemory) * 100
+
+        $vms = Get-VM
+        $totalVMStartupMemory = ($vms | Measure-Object -Property MemoryStartup -Sum).Sum / 1GB
+        $totalVMMaxMemory = ($vms | ForEach-Object { 
+            if ($_.DynamicMemoryEnabled) { $_.MemoryMaximum } else { $_.MemoryStartup }
+        } | Measure-Object -Sum).Sum / 1GB
+
+        return @{
+            Hostname = $env:COMPUTERNAME
+            TotalVMCount = $vms.Count
+            TotalPhysicalMemory = [math]::Ceiling($totalPhysicalMemory)
+            AvailablePhysicalMemory = [math]::Ceiling($availablePhysicalMemory)
+            AvailablePhysicalMemoryPercent = [math]::Round($availablePhysicalMemoryPercent, 2)
+            TotalVMStartupMemory = [math]::Ceiling($totalVMStartupMemory)
+            TotalVMMaxMemory = [math]::Ceiling($totalVMMaxMemory)
+            NumberOfCPU = $computerSystem.NumberOfProcessors
+            CPUSpeed = $processor.MaxClockSpeed
+            NumberOfCores = $processor.NumberOfCores
+            NumberOfLogicalProcessors = $processor.NumberOfLogicalProcessors
+            TotalVirtualProcessors = ($vms | Measure-Object -Property ProcessorCount -Sum).Sum
+        }
+    }
+
+    $hyperVHostDetails += [PSCustomObject]$hostInfo
+}
+
+# Calculate totals
+$totalHosts = $hyperVHostDetails.Count
+$totalVMs = ($hyperVHostDetails | Measure-Object -Property TotalVMCount -Sum).Sum
+$totalPhysicalMemory = ($hyperVHostDetails | Measure-Object -Property TotalPhysicalMemory -Sum).Sum
+$totalAvailablePhysicalMemory = ($hyperVHostDetails | Measure-Object -Property AvailablePhysicalMemory -Sum).Sum
+$averageAvailablePhysicalMemoryPercent = ($hyperVHostDetails | Measure-Object -Property AvailablePhysicalMemoryPercent -Average).Average
+$totalVMStartupMemory = ($hyperVHostDetails | Measure-Object -Property TotalVMStartupMemory -Sum).Sum
+$totalVMMaxMemory = ($hyperVHostDetails | Measure-Object -Property TotalVMMaxMemory -Sum).Sum
+$totalCores = ($hyperVHostDetails | Measure-Object -Property NumberOfCores -Sum).Sum
+$totalLogicalProcessors = ($hyperVHostDetails | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+$totalVirtualProcessors = ($hyperVHostDetails | Measure-Object -Property TotalVirtualProcessors -Sum).Sum
+
+# Determine the class for total Available Physical Memory percentage
+$totalMemoryPercentClass = if ($averageAvailablePhysicalMemoryPercent -lt 50) {
+    'memory-critical'
+} elseif ($averageAvailablePhysicalMemoryPercent -lt 60) {
+    'memory-warning'
+} else {
+    ''
+}
+
+
+Write-Host ("Fetching CSV Information from Cluster " + $ClusterName) -ForegroundColor Green
+
+[array] $CSVstorage = Get-ClusterSharedVolume -Cluster $ClusterName | 
+    Select-Object OwnerNode -ExpandProperty SharedVolumeInfo |
+    Select-Object FriendlyVolumeName, OwnerNode, 
+        @{n="Name";e={($_.FriendlyVolumeName).TrimStart("C:\ClusterStorage\")}},  
+        @{n="Capacity";e={$_.Partition.Size}}, 
+        @{n="UsedSpace";e={$_.Partition.UsedSpace}}, 
+        @{n="FreeSpace";e={$_.Partition.FreeSpace}}, 
+        @{n="FreeSpacePC";e={$_.Partition.PercentFree}}, 
+        @{n="VHDXAllocatedSpace";e={0}}, 
+        @{n="VHDXActualUsage";e={0}}, 
+        @{n="VolumeHealthCode";e={[int]"0"}}, 
+        @{n="DiskGuid";e={$_.Partition.Name}}, 
+        @{n="DiskType";e={"NA"}}, 
+        @{n="RaidType";e={"NA"}}, 
+        @{n="Connectivity";e={"NA"}}, 
+        @{n="StorageInformation";e={"NA"}}
+
+$CSVCount = $CSVStorage.Count
+
+For ($h=0; $h -lt $CSVCount; $h++) {
+    Get-CSVtoPhysicalDiskMapping $CSVStorage[$h].OwnerNode $CSVStorage[$h].DiskGuid
+    If (($CSVStorage[$h].FreeSpacePC -le 10) -OR ($CSVStorage[$h].FreeSpace -lt 53687091200)) {
+        [int] $CSVStorage[$h].VolumeHealthCode = 3
+    }
+    ElseIf ((($CSVStorage[$h].FreeSpacePC -le 15) -And ($CSVStorage[$h].FreeSpacePC -gt 10)) -OR ($CSVStorage[$h].FreeSpace -lt 107374182400)) {
+        [int] $CSVStorage[$h].VolumeHealthCode = 2
+    }
+    ElseIf ((($CSVStorage[$h].FreeSpacePC -le 20) -And ($CSVStorage[$h].FreeSpacePC -gt 15)) -OR ($CSVStorage[$h].FreeSpace -lt 214748364800)) {
+        [int] $CSVStorage[$h].VolumeHealthCode = 1
+    }
+    Else {
+        $CSVStorage[$h].VolumeHealthCode = 0
+    }
+}
+
+
+
+# Create HTML content
+$htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hyper-V Failover Cluster Details - $currentDateTime</title>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 11px; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        h1, h2 { color: #333; font-size: 12px; }
+        .total-row { font-weight: bold; background-color: #e6e6e6; }
+        .not-clustered { background-color: #ffcccc; }
+        .memory-critical { background-color: #ff9999; } /* Red */
+        .memory-warning { background-color: #ffff99; } /* Yellow */
+    </style>
+</head>
+<body>
+    <h1>Hyper-V Failover Cluster Details - $currentDateTime</h1>
+    
+    <h2>Virtual Machine Details</h2>
+    <table>
+        <tr>
+            <th>VM Name</th>
+            <th>Uptime</th>
+            <th>Clustered</th>
+            <th>Assigned Memory (GB)</th>
+            <th>Assigned vCPU</th>
+            <th>Disk Name</th>
+            <th>Disk Type</th>
+            <th>Disk Size (GB)</th>
+        </tr>
+        $(foreach ($vm in $vmDetails) {
+            $diskCount = $vm.'Virtual Disks'.Count
+            $rowspan = if ($diskCount -gt 0) { $diskCount } else { 1 }
+            $clusteredClass = if (-not $vm.Clustered) { ' class="not-clustered"' } else { '' }
+            "<tr>"
+            "<td rowspan='$rowspan'>$($vm.'VM Name')</td>"
+            "<td rowspan='$rowspan'>$($vm.Uptime)</td>"
+            "<td rowspan='$rowspan'$clusteredClass>$($vm.Clustered)</td>"
+            "<td rowspan='$rowspan'>$($vm.'Assigned Memory (GB)')</td>"
+            "<td rowspan='$rowspan'>$($vm.'Assigned vCPU')</td>"
+            if ($diskCount -gt 0) {
+                "<td>$($vm.'Virtual Disks'[0].Name)</td>"
+                "<td>$($vm.'Virtual Disks'[0].Type)</td>"
+                "<td>$($vm.'Virtual Disks'[0].Size)</td>"
+                "</tr>"
+                for ($i = 1; $i -lt $diskCount; $i++) {
+                    "<tr>"
+                    "<td>$($vm.'Virtual Disks'[$i].Name)</td>"
+                    "<td>$($vm.'Virtual Disks'[$i].Type)</td>"
+                    "<td>$($vm.'Virtual Disks'[$i].Size)</td>"
+                    "</tr>"
+                }
+            } else {
+                "<td>-</td><td>-</td><td>-</td></tr>"
+            }
+        })
+    </table>
+
+    <h2>Hyper-V Host Details</h2>
+    <table>
+        <tr>
+            <th>Hostname</th>
+            <th>Total VM Count</th>
+            <th>Total Physical Memory (GB)</th>
+            <th>Available Physical Memory (GB)</th>
+            <th>Available Physical Memory (%)</th>
+            <th>Total VM Startup Memory (GB)</th>
+            <th>Total VM Max Memory (GB)</th>
+            <th>Number of CPU</th>
+            <th>CPU Speed (MHz)</th>
+            <th>Number of Cores</th>
+            <th>Number of Logical Processors</th>
+            <th>Total Virtual Processors</th>
+        </tr>
+        $(foreach ($hvHost in $hyperVHostDetails) {
+            "<tr>"
+            "<td>$($hvHost.Hostname)</td>"
+            "<td>$($hvHost.TotalVMCount)</td>"
+            "<td>$($hvHost.TotalPhysicalMemory)</td>"
+            "<td>$($hvHost.AvailablePhysicalMemory)</td>"
+            "<td>$($hvHost.AvailablePhysicalMemoryPercent)%</td>"
+            "<td>$($hvHost.TotalVMStartupMemory)</td>"
+            "<td>$($hvHost.TotalVMMaxMemory)</td>"
+            "<td>$($hvHost.NumberOfCPU)</td>"
+            "<td>$($hvHost.CPUSpeed)</td>"
+            "<td>$($hvHost.NumberOfCores)</td>"
+            "<td>$($hvHost.NumberOfLogicalProcessors)</td>"
+            "<td>$($hvHost.TotalVirtualProcessors)</td>"
+            "</tr>"
+        })
+        <tr class="total-row">
+            <td>Total ($totalHosts hosts)</td>
+            <td>$totalVMs</td>
+            <td>$totalPhysicalMemory</td>
+            <td>$totalAvailablePhysicalMemory</td>
+            <td class="$totalMemoryPercentClass">$([math]::Round($averageAvailablePhysicalMemoryPercent, 1))% </td>
+            <td>$totalVMStartupMemory</td>
+            <td>$totalVMMaxMemory</td>
+            <td>-</td>
+            <td>-</td>
+            <td>$totalCores</td>
+            <td>$totalLogicalProcessors</td>
+            <td>$totalVirtualProcessors</td>
+        </tr>
+    </table>
+
+<h2>Storage Report</h2>
+<table>
+    <tr>
+        <th>Volume Name</th>
+        <th>Volume Type</th>
+        <th>RAID Level</th>
+        <th>Storage</th>
+        <th>Storage Connection</th>
+        <th>Total Capacity (GB)</th>
+        <th>Current Free Space (GB)</th>
+        <th>Free Space (%)</th>
+        <th>Owner Node</th>
+    </tr>
+    $(foreach ($csv in $CSVStorage) {
+        $freeSpaceClass = if ($csv.FreeSpacePC -le 10) {
+            'memory-critical'
+        } elseif ($csv.FreeSpacePC -le 20) {
+            'memory-warning'
+        } else {
+            ''
+        }
+        "<tr>"
+        "<td>$($csv.Name)</td>"
+        "<td>$($csv.DiskType)</td>"
+        "<td>$($csv.RaidType)</td>"
+        "<td>$($csv.StorageInformation)</td>"
+        "<td>$($csv.Connectivity)</td>"
+        "<td>$([math]::Round($csv.Capacity / 1GB, 2))</td>"
+        "<td>$([math]::Round($csv.FreeSpace / 1GB, 2))</td>"
+        "<td class='$freeSpaceClass'>$([math]::Round($csv.FreeSpacePC, 2))%</td>"
+        "<td>$($csv.OwnerNode)</td>"
+        "</tr>"
+    })
+</table>
+
+
+</body>
+</html>
+"@
+
+# Generate the output file name with date and time
+$outputFileName = "ClusterVMDetails_$fileDateTime.html"
+$fullOutputPath = Join-Path -Path $OutputPath -ChildPath $outputFileName
+
+# Save the HTML content to a file
+$htmlContent | Out-File -FilePath $fullOutputPath -Encoding UTF8
+
+Write-Host "HTML report has been generated: $fullOutputPath"
