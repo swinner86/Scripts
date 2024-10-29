@@ -264,6 +264,17 @@ $totalVMStartupMemoryClass = if ($memoryThreshold - $totalVMStartupMemory -lt 20
 }
 
 
+# Add this diagnostic code right after your VM collection loop
+Write-Host "Checking VM disk collection..."
+foreach ($vm in $vmDetails) {
+    Write-Host "`nVM: $($vm.'VM Name')"
+    Write-Host "Virtual Disks property exists: $($null -ne $vm.'Virtual Disks')"
+    Write-Host "Virtual Disks count: $($vm.'Virtual Disks'.Count)"
+    $vm.'Virtual Disks' | Format-Table Name, Type, Size, CSVLocation -AutoSize
+}
+
+$maxDisks = ($vmDetails | ForEach-Object { $_.'Virtual Disks'.Count } | Measure-Object -Maximum).Maximum
+Write-Host "Maximum number of disks on a single VM: $maxDisks"
 
 
 # Create HTML content
@@ -303,44 +314,37 @@ $htmlContent = @"
         <th>Clustered</th>
         <th>Assigned Memory (GB)</th>
         <th>Assigned vCPU</th>
-        <th>Disk Name</th>
-        <th>Disk Type</th>
-        <th>Disk Size (GB)</th>
-        <th>CSV Location</th>
-        <th>Current Usage (GB)</th>
+        $(foreach ($i in 1..$maxDisks) {
+            "<th>Disk ${i} Name</th>
+            <th>Disk ${i} Type</th>
+            <th>Disk ${i} Size (GB)</th>
+            <th>Disk ${i} CSV</th>
+            <th>Disk ${i} Usage (GB)</th>"
+        })
     </tr>
     $(foreach ($vm in $vmDetails) {
-        $diskCount = $vm.'Virtual Disks'.Count
-        $rowspan = if ($diskCount -gt 0) { $diskCount } else { 1 }
         $clusteredClass = if (-not $vm.Clustered) { ' class="not-clustered"' } else { '' }
-        
-        "<tr>"
-        "<td rowspan='$rowspan'>$($vm.'VM Name')</td>"
-        "<td rowspan='$rowspan'>$($vm.Uptime)</td>"
-        "<td rowspan='$rowspan'$clusteredClass>$($vm.Clustered)</td>"
-        "<td rowspan='$rowspan'>$($vm.'Assigned Memory (GB)')</td>"
-        "<td rowspan='$rowspan'>$($vm.'Assigned vCPU')</td>"
-        
-        if ($diskCount -gt 0) {
-            "<td>$(Split-Path $vm.'Virtual Disks'[0].Name -Leaf)</td>"
-            "<td>$($vm.'Virtual Disks'[0].Type)</td>"
-            "<td>$($vm.'Virtual Disks'[0].Size)</td>"
-            "<td>$($vm.'Virtual Disks'[0].CSVLocation)</td>"
-            "<td>$([math]::Round($vm.'Virtual Disks'[0].CurrentUsage / 1GB, 2))</td>"
-            "</tr>"
-            
-            for ($i = 1; $i -lt $diskCount; $i++) {
-                "<tr>"
-                "<td>$(Split-Path $vm.'Virtual Disks'[$i].Name -Leaf)</td>"
-                "<td>$($vm.'Virtual Disks'[$i].Type)</td>"
-                "<td>$($vm.'Virtual Disks'[$i].Size)</td>"
-                "<td>$($vm.'Virtual Disks'[$i].CSVLocation)</td>"
-                "<td>$([math]::Round($vm.'Virtual Disks'[$i].CurrentUsage / 1GB, 2))</td>"
-                "</tr>"
+        $diskEntries = ""
+        for ($i = 0; $i -lt $maxDisks; $i++) {
+            if ($null -ne $vm.'Virtual Disks' -and $vm.'Virtual Disks'.Count -gt $i) {
+                $disk = $vm.'Virtual Disks'[$i]
+                $diskEntries += "<td>$(Split-Path $disk.Name -Leaf)</td>
+                                <td>$($disk.Type)</td>
+                                <td>$($disk.Size)</td>
+                                <td>$($disk.CSVLocation)</td>
+                                <td>$([math]::Round($disk.CurrentUsage / 1GB, 2))</td>"
+            } else {
+                $diskEntries += "<td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td>"
             }
-        } else {
-            "<td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>"
         }
+        "<tr>
+            <td>$($vm.'VM Name')</td>
+            <td>$($vm.Uptime)</td>
+            <td$clusteredClass>$($vm.Clustered)</td>
+            <td>$($vm.'Assigned Memory (GB)')</td>
+            <td>$($vm.'Assigned vCPU')</td>
+            $diskEntries
+        </tr>"
     })
 </table>
 
