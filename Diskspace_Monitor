@@ -1,0 +1,124 @@
+# MS 365 DiskSpace Report Script
+
+# Import required modules
+Import-Module MSAL.PS
+Import-Module ActiveDirectory
+
+# Configuration
+$config = @{
+    TenantId = "651f922d-8891-4b74-ba90-6169a36cfcf2"
+    ClientId = "783aa7f9-c163-4aa5-a4fd-e27a273a900b"
+    ClientSecretPath = "C:\Program Files\Scripts\itsupport_SendAs.dat"
+    Scope = "https://graph.microsoft.com/.default"
+    FreeSpaceFileName = "FreeSpace.htm"
+    WarningThreshold = 20
+    CriticalThreshold = 15
+    Recipients = @('dominik.gyger@wagner.ch', 'itsupport@gloor.ch')
+    MailFrom = "itsupport@gloor.ch"
+}
+
+# Function to write HTML content
+function Write-HtmlContent {
+    param (
+        [string]$FileName,
+        [string]$Content
+    )
+    Add-Content -Path $FileName -Value $Content
+}
+
+# Function to get disk info
+function Get-DiskInfo {
+    param (
+        [string]$ServerName
+    )
+    Get-WmiObject win32_logicaldisk -ComputerName $ServerName | 
+        Where-Object { $_.drivetype -eq 3 } | 
+        Select-Object DeviceID, VolumeName, @{
+            Name = "TotalSpace"; Expression = { [math]::Round($_.Size / 1GB, 2) }
+        }, @{
+            Name = "FreeSpace"; Expression = { [math]::Round($_.FreeSpace / 1GB, 2) }
+        }, @{
+            Name = "UsedSpace"; Expression = { [math]::Round(($_.Size - $_.FreeSpace) / 1GB, 2) }
+        }, @{
+            Name = "FreePercent"; Expression = { [math]::Round(($_.FreeSpace / $_.Size) * 100, 0) }
+        }
+}
+
+# Generate HTML report
+$date = (Get-Date).ToString('yyyy/MM/dd')
+$htmlContent = @"
+<html>
+<head>
+    <meta http-equiv='Content-Type' content='text/html; charset=iso-8859-1'>
+    <title>Server DiskSpace Report</title>
+    <style>
+        body { font-family: Tahoma; font-size: 10px; color: #003399; background-color: #fff; }
+        table { font-family: Tahoma; font-size: 10px; border-collapse: collapse; width: 100%; background-color: #e8e8e8; }
+        td { border: 1px solid #999; padding: 5px; width: 100px;}
+        .header { color: #003399; text-align: left; font-weight: bold; background-color: #CCC; }
+        .warning { background-color: #FFFF00; }
+        .critical { background-color: #FF0000; }
+        .ok { background-color: #00FF00; }
+    </style>
+</head>
+<body>
+    <h1 align="center">DiskSpace Report - Gloor AG - $date</h1>
+"@
+
+$servers = Get-ADComputer -Filter {
+    OperatingSystem -Like "*Server*" -and (OperatingSystemVersion -like "6*" -or OperatingSystemVersion -like "10*")
+} | Sort-Object Name | Select-Object -ExpandProperty Name
+
+foreach ($server in $servers) {
+    $htmlContent += "<h2>$server</h2>"
+    $htmlContent += "<table><tr class='header'><td>Drive</td><td>Label</td><td>Total (GB)</td><td>Used (GB)</td><td>Free (GB)</td><td>Free %</td></tr>"
+
+    $diskInfo = Get-DiskInfo -ServerName $server
+    foreach ($disk in $diskInfo) {
+        $colorClass = if ($disk.FreePercent -le $config.CriticalThreshold) { "critical" }
+                      elseif ($disk.FreePercent -le $config.WarningThreshold) { "warning" }
+                      else { "ok" }
+        $htmlContent += "<tr><td>$($disk.DeviceID)</td><td>$($disk.VolumeName)</td><td>$($disk.TotalSpace)</td><td>$($disk.UsedSpace)</td><td>$($disk.FreeSpace)</td><td class='$colorClass'>$($disk.FreePercent)%</td></tr>"
+    }
+
+    $htmlContent += "</table>"
+}
+
+$htmlContent += "</body></html>"
+
+# Save HTML report
+$htmlContent | Out-File -FilePath $config.FreeSpaceFileName -Encoding UTF8
+
+# Send email using Microsoft Graph API
+$clientSecret = Get-Content $config.ClientSecretPath | ConvertTo-SecureString
+$msalToken = Get-MsalToken -TenantId $config.TenantId -ClientId $config.ClientId -ClientSecret $clientSecret -Scopes $config.Scope
+
+$headers = @{
+    "Authorization" = "Bearer $($msalToken.AccessToken)"
+    "Content-Type" = "application/json"
+}
+
+$attachmentContent = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($htmlContent))
+$recipients = $config.Recipients | ForEach-Object { @{EmailAddress = @{Address = $_}} }
+
+$emailBody = @{
+    message = @{
+        subject = "Disk Space Report - Gloor AG - $date"
+        body = @{
+            contentType = "HTML"
+            content = "<h1>DiskSpace Report - Gloor AG</h1><p>Im Anhang befindet sich der DiskSpace Report.</p>"
+        }
+        toRecipients = $recipients
+        attachments = @(
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name = (Split-Path $config.FreeSpaceFileName -Leaf)
+                contentType = "text/html"
+                contentBytes = $attachmentContent
+            }
+        )
+    }
+    saveToSentItems = "false"
+}
+
+Invoke-RestMethod -Method Post -Uri "https://graph.microsoft.com/v1.0/users/$($config.MailFrom)/sendMail" -Body ($emailBody | ConvertTo-Json -Depth 4) -Headers $headers
