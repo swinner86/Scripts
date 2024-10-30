@@ -350,8 +350,7 @@ $htmlContent = @"
             "<th>Disk ${i} Name</th>
             <th>Disk ${i} Type</th>
             <th>Disk ${i} Size (GB)</th>
-            <th>Disk ${i} CSV</th>
-            <th>Disk ${i} Usage (GB)</th>"
+            <th>Disk ${i} CSV</th>"
         })
     </tr>
 <thead>
@@ -365,10 +364,9 @@ $htmlContent = @"
                 $diskEntries += "<td>$(Split-Path $disk.Name -Leaf)</td>
                                 <td>$($disk.Type)</td>
                                 <td>$($disk.Size)</td>
-                                <td>$($disk.CSVLocation)</td>
-                                <td>$([math]::Round($disk.CurrentUsage / 1GB, 2))</td>"
+                                <td>$($disk.CSVLocation)</td>"
             } else {
-                $diskEntries += "<td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td>"
+                $diskEntries += "<td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td>"
             }
         }
         "<tr>
