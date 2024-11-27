@@ -1,14 +1,27 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$ClusterName,
+    [Parameter(Mandatory=$false)]
+    [string]$ClusterName = "Clusternamen angeben",
 	
-	[Parameter(Mandatory=$true)]
-    [string]$Customer,
+	[Parameter(Mandatory=$false)]
+    [string]$Customer = "Kundenname",
 
     [Parameter(Mandatory=$false)]
-    [string]$OutputPath = "C:\Scripts"
+    [string]$OutputPath = "C:\temp"
 )
+
+
+# Configuration
+$config = @{
+    TenantId = "Hier Tenant ID eintragen"
+    ClientId = "Hier Client ID eintragen"
+    ClientSecretPath = "C:\Program Files\Scripts\itsupport_SendAs.dat"
+    Scope = "https://graph.microsoft.com/.default"
+    Recipients = @('Empfänger-Mail')
+    MailFrom = "Absender-Mail"
+}
+
+
 
 # Create output directory if it doesn't exist
 New-Item -ItemType Directory -Path $OutputPath -Force
@@ -85,9 +98,6 @@ foreach ($module in $requiredModules) {
 $scriptStartTime = Get-Date
 $reportTimestamp = Get-Date -Format "yyyy-MM-dd"
 $executionTime = {(Get-Date) - $scriptStartTime}
-
-# Specify the name of your failover cluster
-# $clusterName = "cluhyp01"
 
 Write-Host ("Fetching Information from Cluster " + $ClusterName) -ForegroundColor Green
 
@@ -477,3 +487,42 @@ $fullOutputPath = Join-Path -Path $OutputPath -ChildPath $outputFileName
 $htmlContent | Out-File -FilePath $fullOutputPath -Encoding UTF8
 
 Write-Host "HTML report has been generated: $fullOutputPath"
+
+
+# Send email using Microsoft Graph API
+$clientSecret = Get-Content $config.ClientSecretPath | ConvertTo-SecureString
+$msalToken = Get-MsalToken -TenantId $config.TenantId -ClientId $config.ClientId -ClientSecret $clientSecret -Scopes $config.Scope
+
+$headers = @{
+    "Authorization" = "Bearer $($msalToken.AccessToken)"
+    "Content-Type" = "application/json"
+}
+
+$attachmentContent = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($htmlcontent))
+
+$emailBody = @{
+    message = @{
+        subject = "Hyper-V Report - $Customer - $scriptStartTime"
+        body = @{
+            contentType = "html"
+            content = "Please find the Hyper-V Report attached."
+        }
+        toRecipients = @(
+            @{
+                emailAddress = @{
+                    address = $config.Recipients[0]
+                }
+            }
+        )
+        attachments = @(
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name = $outputFileName
+                contentBytes = $attachmentContent
+            }
+        )
+    }
+}
+
+$jsonBody = $emailBody | ConvertTo-Json -Depth 10 -Compress
+Invoke-RestMethod -Method Post -Uri "https://graph.microsoft.com/v1.0/users/$($config.MailFrom)/sendMail" -Body $jsonBody -Headers $headers
