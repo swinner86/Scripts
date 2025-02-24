@@ -1,0 +1,37 @@
+# Get all vbk and vib files
+$backupFiles = Get-ChildItem -Path "B:" -File -Recurse | Where-Object { $_.Extension -in '.vbk','.vib' }
+
+# Group files by server name
+$serverGroups = $backupFiles | Group-Object { 
+    # Extract server name from filename up to first dot
+    $_.Name.Split('.')[0]
+}
+
+# Process each server group
+foreach($group in $serverGroups) {
+    # Get newest VBK file for reference
+    $newestVBK = $group.Group | Where-Object { $_.Extension -eq '.vbk' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    
+    if($newestVBK) {
+        # Get files to process
+        $filesToCheck = $group.Group | Sort-Object LastWriteTime -Descending
+        
+        foreach($file in $filesToCheck) {
+            # Keep file if it's a VIB newer than the newest VBK
+            if($file.Extension -eq '.vib' -and $file.LastWriteTime -gt $newestVBK.LastWriteTime) {
+                Write-Host "Keeping newer VIB file: $($file.Name)"
+                continue
+            }
+            
+            # Skip the newest VBK file
+            if($file.FullName -eq $newestVBK.FullName) {
+                Write-Host "Keeping newest VBK file: $($file.Name)"
+                continue
+            }
+            
+            # Delete all other files
+            Remove-Item $file.FullName -Force
+            Write-Host "Deleted: $($file.Name)"
+        }
+    }
+}
